@@ -1,68 +1,49 @@
 # Shirazen Time Tracker
 
-A professional time tracking extension for Visual Studio Code that helps you track your work time with pause/resume functionality.
+A reliable, project-aware time tracker for Visual Studio Code with persistent timers and polished Excel reporting.
 
-## Features
+## Highlights
 
-- 🕒 Track work time with start, pause, resume, and stop functionality
-- 📊 Save work logs in both JSON and Excel formats
-- 📅 Support for multiple work sessions per day
-- 📂 Automatic folder opening after saving
-- 🔄 Continuous timer after saving (no need to restart)
-- 🎯 Project-based time tracking
+- Start, pause, resume, save, reset, and stop work sessions from VS Code.
+- Keep the active timer after a VS Code reload or restart.
+- Use the workspace name automatically or configure a custom project name.
+- View today's session count and total tracked time instantly.
+- Store a lossless JSON history and regenerate a professional Excel workbook after every save.
 
-## Installation
+## Professional Excel report
 
-1. Download the latest `.vsix` file from the releases
-2. Open VS Code
-3. Go to the Extensions view (Ctrl+Shift+X)
-4. Click on the "..." menu and select "Install from VSIX..."
-5. Choose the downloaded `.vsix` file
-6. Reload VS Code
+The generated `shirazen-time-tracker.xlsx` workbook includes:
 
-## Usage
+- **Work Sessions** — sortable session-level history with project, start/end time, duration, and decimal hours.
+- **Daily Summary** — daily totals grouped by project.
+- **Project Summary** — lifetime totals, session counts, and latest activity by project.
+- Styled Excel tables, frozen headings, filters, print-friendly pages, totals, conditional formatting, and consistent column sizing.
 
-1. Open the Command Palette (Ctrl+Shift+P)
-2. Type "Shirazen Time Tracker" to see available commands:
-   - `Start Timer`: Start tracking time
-   - `Pause Timer`: Pause the current timer
-   - `Resume Timer`: Resume a paused timer
-   - `Save Timer`: Save current work time and start a new session
-   - `Stop Timer`: Stop the current timer
+Reports are saved in the extension's global storage folder. Run **Shirazen: Open Time Logs Folder** to reveal them.
 
-## Data Storage
+## Commands
 
-- Work logs are saved in two formats:
-  - JSON: Stored in the extension's global storage
-  - Excel: Automatically generated and saved in the extension's global storage
-- Each work session includes:
-  - Project name
-  - Start time
-  - End time
-  - Duration
-  - Multiple sessions per day are supported
+Open the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and search for `Shirazen`:
 
-## Requirements
+- `Shirazen: Start Timer`
+- `Shirazen: Pause/Resume Timer`
+- `Shirazen: Save Session and Continue`
+- `Shirazen: Stop Timer`
+- `Shirazen: Reset Timer`
+- `Shirazen: Show Today's Summary`
+- `Shirazen: Open Time Logs Folder`
 
-- Visual Studio Code 1.60.0 or higher
-- Node.js 14.0.0 or higher
+## Settings
 
-## Extension Settings
+`shirazenTimeTracker.defaultProject` sets the project name written to reports. Leave it empty to use the current workspace name.
 
-This extension contributes the following settings:
+## Development
 
-- `shirazenTimeTracker.defaultProject`: Default project name for new timers
-
-## Known Issues
-
-- None at the moment
-
-
-
-## Contributing
-
-Feel free to submit issues and enhancement requests.
+```bash
+npm install
+npm test
+```
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details. 
+MIT
