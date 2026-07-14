@@ -1,32 +1,20 @@
 # Dependencies
 node_modules/
-package-lock.json
 
 # Build output
 out/
 dist/
 
-# VS Code
+# VS Code packages and settings
 .vscode/
 *.vsix
 
-# Logs
+# Logs and coverage
 *.log
-npm-debug.log*
-
-# OS
-.DS_Store
-Thumbs.db
-
-# TypeScript
+coverage/
 *.tsbuildinfo
 
-# Test coverage
-coverage/
-
-# Environment variables
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local 
+# OS and environment
+.DS_Store
+Thumbs.db
+.env*
