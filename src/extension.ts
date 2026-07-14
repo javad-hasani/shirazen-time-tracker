@@ -1,10 +1,10 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as XLSX from 'xlsx';
+import * as ExcelJS from 'exceljs';
+import { formatLocalDate, formatLocalTime, TimeFormatter } from './time';
 
-// Interfaces
-interface IWorkLog {
+interface WorkLog {
     date: string;
     duration: string;
     startTime: string;
@@ -13,444 +13,401 @@ interface IWorkLog {
     totalDurationMs: number;
 }
 
-interface ITimeFormatter {
-    formatDuration(ms: number): string;
-    parseDuration(duration: string): number;
+interface TimerState {
+    isRunning: boolean;
+    isPaused: boolean;
+    startTime: number;
+    pauseStartTime: number;
+    totalPausedTime: number;
 }
 
-interface IStorageStrategy {
-    save(workLog: IWorkLog): void;
-}
+const TIMER_STATE_KEY = 'shirazen.timerState';
 
-// Time Formatter Implementation
-class TimeFormatter implements ITimeFormatter {
-    private padNumber(num: number): string {
-        return num.toString().padStart(2, '0');
-    }
+class WorkLogRepository {
+    private readonly jsonFile: string;
+    private readonly excelFile: string;
+    private readonly formatter = new TimeFormatter();
 
-    public formatDuration(ms: number): string {
-        const hours = Math.floor(ms / (1000 * 60 * 60));
-        const minutes = Math.floor((ms % (1000 * 60 * 60)) / (1000 * 60));
-        const seconds = Math.floor((ms % (1000 * 60)) / 1000);
-        return `${this.padNumber(hours)}:${this.padNumber(minutes)}:${this.padNumber(seconds)}`;
-    }
-
-    public parseDuration(duration: string): number {
-        const [hours, minutes, seconds] = duration.split(':').map(Number);
-        return (hours * 60 * 60 * 1000) + (minutes * 60 * 1000) + (seconds * 1000);
-    }
-}
-
-// Storage Strategies
-class JsonStorageStrategy implements IStorageStrategy {
-    private workLogsFile: string;
-
-    constructor(workLogsFile: string) {
-        this.workLogsFile = workLogsFile;
-        this.ensureFileExists();
-    }
-
-    private ensureFileExists(): void {
-        if (!fs.existsSync(this.workLogsFile)) {
-            fs.writeFileSync(this.workLogsFile, '[]', 'utf8');
+    constructor(storageDirectory: string) {
+        fs.mkdirSync(storageDirectory, { recursive: true });
+        this.jsonFile = path.join(storageDirectory, 'work-logs.json');
+        this.excelFile = path.join(storageDirectory, 'shirazen-time-tracker.xlsx');
+        if (!fs.existsSync(this.jsonFile)) {
+            fs.writeFileSync(this.jsonFile, '[]', 'utf8');
         }
     }
 
-    public save(workLog: IWorkLog): void {
+    public getLogs(): WorkLog[] {
         try {
-            const fileContent = fs.readFileSync(this.workLogsFile, 'utf8');
-            const logs: IWorkLog[] = JSON.parse(fileContent);
-            logs.push(workLog);
-            fs.writeFileSync(this.workLogsFile, JSON.stringify(logs, null, 2), 'utf8');
+            const parsed = JSON.parse(fs.readFileSync(this.jsonFile, 'utf8'));
+            return Array.isArray(parsed) ? parsed.filter(this.isValidLog) : [];
         } catch (error) {
-            console.error('Error saving to JSON:', error);
-            throw error;
-        }
-    }
-}
-
-class ExcelStorageStrategy implements IStorageStrategy {
-    private excelFile: string;
-    private timeFormatter: ITimeFormatter;
-
-    constructor(excelFile: string, timeFormatter: ITimeFormatter) {
-        this.excelFile = excelFile;
-        this.timeFormatter = timeFormatter;
-    }
-
-    public save(workLog: IWorkLog): void {
-        let wb: XLSX.WorkBook;
-        let existingData: any[] = [];
-
-        if (fs.existsSync(this.excelFile)) {
-            try {
-                wb = XLSX.readFile(this.excelFile);
-                if (wb.SheetNames.length > 0) {
-                    const ws = wb.Sheets[wb.SheetNames[0]];
-                    if (ws) {
-                        existingData = XLSX.utils.sheet_to_json(ws);
-                    }
-                }
-            } catch (error) {
-                console.error('Error reading Excel file:', error);
-                wb = XLSX.utils.book_new();
-            }
-        } else {
-            wb = XLSX.utils.book_new();
-        }
-
-        this.updateExcelData(existingData, workLog, wb);
-    }
-
-    private updateExcelData(existingData: any[], workLog: IWorkLog, wb: XLSX.WorkBook): void {
-        const todayRecord = existingData.find(record => record['Date'] === workLog.date);
-        
-        if (todayRecord) {
-            this.updateExistingRecord(todayRecord, workLog, existingData);
-        } else {
-            this.addNewRecord(workLog, existingData);
-        }
-
-        this.sortAndSaveData(existingData, wb);
-    }
-
-    private updateExistingRecord(todayRecord: any, workLog: IWorkLog, existingData: any[]): void {
-        try {
-            const previousDuration = this.timeFormatter.parseDuration(todayRecord['Total Duration']);
-            const totalDurationMs = previousDuration + workLog.totalDurationMs;
-
-            let times = [];
-            if (todayRecord['Work Sessions']) {
-                times = todayRecord['Work Sessions'].split('\n');
-            }
-            times.push(`${workLog.startTime} - ${workLog.endTime}`);
-
-            todayRecord['Total Duration'] = this.timeFormatter.formatDuration(totalDurationMs);
-            todayRecord['Work Sessions'] = times.join('\n');
-            
-            existingData = existingData.filter(record => record['Date'] !== workLog.date);
-            existingData.push(todayRecord);
-        } catch (error) {
-            console.error('Error updating record:', error);
-            this.addNewRecord(workLog, existingData);
+            console.error('Unable to read work logs:', error);
+            return [];
         }
     }
 
-    private addNewRecord(workLog: IWorkLog, existingData: any[]): void {
-        existingData.push({
-            'Date': workLog.date,
-            'Total Duration': workLog.duration,
-            'Work Sessions': `${workLog.startTime} - ${workLog.endTime}`
-        });
+    public async save(log: WorkLog): Promise<void> {
+        const logs = this.getLogs();
+        logs.push(log);
+        this.writeJsonAtomically(logs);
+        await this.writeProfessionalWorkbook(logs);
     }
 
-    private sortAndSaveData(existingData: any[], wb: XLSX.WorkBook): void {
-        existingData.sort((a, b) => {
-            try {
-                const dateA = new Date(a['Date'].split('/').reverse().join('/'));
-                const dateB = new Date(b['Date'].split('/').reverse().join('/'));
-                return dateA.getTime() - dateB.getTime();
-            } catch (error) {
-                return 0;
-            }
-        });
-
-        // Create header with styling
-        const headers = ['Date', 'Total Duration', 'Work Sessions'];
-        const ws = XLSX.utils.aoa_to_sheet([headers]);
-        
-        // Add data rows
-        XLSX.utils.sheet_add_json(ws, existingData, {
-            header: headers,
-            skipHeader: true,
-            origin: 'A2'
-        });
-
-        // Apply cell styles
-        this.applyWorksheetStyles(ws, existingData.length + 1);
-
-        // Add title and info
-        const titleRow = ['ShahGhasem Time Tracker - Work Sessions Log'];
-        const infoRow = [`Generated on: ${new Date().toLocaleString()}`];
-        XLSX.utils.sheet_add_aoa(ws, [titleRow], { origin: 'A1' });
-        XLSX.utils.sheet_add_aoa(ws, [infoRow], { origin: `A${existingData.length + 4}` });
-
-        // Protect worksheet
-        ws['!protect'] = {
-            password: '',
-            formatCells: false,
-            formatColumns: false,
-            formatRows: false,
-            insertColumns: false,
-            insertRows: false,
-            insertHyperlinks: false,
-            deleteColumns: false,
-            deleteRows: false,
-            sort: false,
-            autoFilter: false,
-            pivotTables: false,
-            selectLockedCells: true,
-            selectUnlockedCells: true
+    public getTodaySummary(): { sessions: number; durationMs: number } {
+        const today = formatLocalDate(new Date());
+        const logs = this.getLogs().filter(log => this.normalizedDate(log.date) === today);
+        return {
+            sessions: logs.length,
+            durationMs: logs.reduce((total, log) => total + this.durationMs(log), 0)
         };
-
-        // Lock all cells
-        const range = XLSX.utils.decode_range(ws['!ref'] || 'A1');
-        for (let R = range.s.r; R <= range.e.r; R++) {
-            for (let C = range.s.c; C <= range.e.c; C++) {
-                const cell = ws[XLSX.utils.encode_cell({ r: R, c: C })];
-                if (cell) {
-                    if (!cell.s) cell.s = {};
-                    cell.s.locked = true;
-                    cell.s.protection = { locked: true };
-                }
-            }
-        }
-
-        if (wb.SheetNames.includes('Work Sessions')) {
-            wb.SheetNames = wb.SheetNames.filter(name => name !== 'Work Sessions');
-            delete wb.Sheets['Work Sessions'];
-        }
-
-        XLSX.utils.book_append_sheet(wb, ws, 'Work Sessions');
-        XLSX.writeFile(wb, this.excelFile);
     }
 
-    private applyWorksheetStyles(ws: XLSX.WorkSheet, totalRows: number): void {
-        // Column widths
-        ws['!cols'] = [
-            { wch: 15 }, // Date
-            { wch: 15 }, // Total Duration
-            { wch: 60 }  // Work Sessions
-        ];
-
-        // Row heights
-        ws['!rows'] = Array(totalRows).fill({ hpt: 25 });
-        ws['!rows'][0] = { hpt: 35 }; // Header row height
-        ws['!rows'][1] = { hpt: 40 }; // Title row height
-
-        // Style all cells
-        const range = XLSX.utils.decode_range(ws['!ref'] || 'A1');
-        for (let R = range.s.r; R <= range.e.r; R++) {
-            for (let C = range.s.c; C <= range.e.c; C++) {
-                const cellAddress = XLSX.utils.encode_cell({ r: R, c: C });
-                const cell = ws[cellAddress];
-                if (!cell) continue;
-
-                if (!cell.s) cell.s = {};
-
-                // Default cell style
-                cell.s.font = { name: 'Calibri', sz: 11 };
-                cell.s.alignment = { vertical: 'center', horizontal: 'left', wrapText: true };
-                cell.s.border = {
-                    top: { style: 'thin', color: { rgb: 'D3D3D3' } },
-                    bottom: { style: 'thin', color: { rgb: 'D3D3D3' } },
-                    left: { style: 'thin', color: { rgb: 'D3D3D3' } },
-                    right: { style: 'thin', color: { rgb: 'D3D3D3' } }
-                };
-
-                // Header row style (dark blue)
-                if (R === 1) {
-                    cell.s.font = { name: 'Calibri', sz: 12, bold: true, color: { rgb: 'FFFFFF' } };
-                    cell.s.fill = { fgColor: { rgb: '2F5597' }, type: 'pattern', patternType: 'solid' };
-                    cell.s.alignment = { vertical: 'center', horizontal: 'center' };
-                    cell.s.border = {
-                        top: { style: 'medium', color: { rgb: '1F4287' } },
-                        bottom: { style: 'medium', color: { rgb: '1F4287' } },
-                        left: { style: 'medium', color: { rgb: '1F4287' } },
-                        right: { style: 'medium', color: { rgb: '1F4287' } }
-                    };
-                }
-
-                // Title style (light blue background)
-                if (R === 0) {
-                    cell.s.font = { name: 'Calibri', sz: 14, bold: true, color: { rgb: '2F5597' } };
-                    cell.s.fill = { fgColor: { rgb: 'D9E2F3' }, type: 'pattern', patternType: 'solid' };
-                    cell.s.alignment = { vertical: 'center', horizontal: 'center' };
-                    cell.s.border = {
-                        bottom: { style: 'medium', color: { rgb: '2F5597' } }
-                    };
-                }
-
-                // Alternate row colors (very light gray)
-                if (R > 1 && R % 2 === 0) {
-                    cell.s.fill = { fgColor: { rgb: 'F8F9FA' }, type: 'pattern', patternType: 'solid' };
-                }
-
-                // Total Duration column style (center-aligned)
-                if (C === 1 && R > 1) {
-                    cell.s.alignment = { vertical: 'center', horizontal: 'center' };
-                    cell.s.font = { ...cell.s.font, color: { rgb: '2F5597' } };
-                }
-
-                // Date column style
-                if (C === 0 && R > 1) {
-                    cell.s.alignment = { vertical: 'center', horizontal: 'center' };
-                }
-            }
+    private readonly isValidLog = (value: unknown): value is WorkLog => {
+        if (!value || typeof value !== 'object') {
+            return false;
         }
+        const log = value as Partial<WorkLog>;
+        return typeof log.date === 'string'
+            && typeof log.duration === 'string'
+            && typeof log.startTime === 'string'
+            && typeof log.endTime === 'string'
+            && typeof log.project === 'string';
+    };
 
-        // Merge title cells
-        ws['!merges'] = [
-            { s: { r: 0, c: 0 }, e: { r: 0, c: 2 } }  // Merge title row
+    private durationMs(log: WorkLog): number {
+        return Number.isFinite(log.totalDurationMs)
+            ? Math.max(0, log.totalDurationMs)
+            : this.formatter.parseDuration(log.duration);
+    }
+
+    private writeJsonAtomically(logs: WorkLog[]): void {
+        const temporaryFile = `${this.jsonFile}.tmp`;
+        fs.writeFileSync(temporaryFile, JSON.stringify(logs, null, 2), 'utf8');
+        fs.renameSync(temporaryFile, this.jsonFile);
+    }
+
+    private normalizedDate(value: string): string {
+        if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+            return value;
+        }
+        const parsed = new Date(value);
+        return Number.isNaN(parsed.getTime()) ? value : formatLocalDate(parsed);
+    }
+
+    private async writeProfessionalWorkbook(logs: WorkLog[]): Promise<void> {
+        const workbook = new ExcelJS.Workbook();
+        workbook.creator = 'Shirazen Time Tracker';
+        workbook.lastModifiedBy = 'Shirazen Time Tracker';
+        workbook.created = new Date();
+        workbook.modified = new Date();
+        workbook.calcProperties.fullCalcOnLoad = true;
+
+        this.addSessionsSheet(workbook, logs);
+        this.addDailySummarySheet(workbook, logs);
+        this.addProjectSummarySheet(workbook, logs);
+
+        const temporaryFile = `${this.excelFile}.tmp.xlsx`;
+        await workbook.xlsx.writeFile(temporaryFile);
+        if (fs.existsSync(this.excelFile)) {
+            fs.unlinkSync(this.excelFile);
+        }
+        fs.renameSync(temporaryFile, this.excelFile);
+    }
+
+    private addSessionsSheet(workbook: ExcelJS.Workbook, logs: WorkLog[]): void {
+        const sheet = workbook.addWorksheet('Work Sessions', {
+            views: [{ state: 'frozen', ySplit: 4 }],
+            properties: { tabColor: { argb: 'FF2563EB' } },
+            pageSetup: { orientation: 'landscape', fitToPage: true, fitToWidth: 1 }
+        });
+
+        this.addSheetHeading(sheet, 'Shirazen Time Tracker', 'Detailed work-session history');
+        const rows = logs
+            .slice()
+            .sort((a, b) => `${this.normalizedDate(a.date)} ${a.startTime}`.localeCompare(`${this.normalizedDate(b.date)} ${b.startTime}`))
+            .map(log => [
+                this.normalizedDate(log.date),
+                log.project || 'unknown-project',
+                log.startTime,
+                log.endTime,
+                this.formatter.formatDuration(this.durationMs(log)),
+                this.durationMs(log) / 3_600_000
+            ]);
+
+        sheet.addTable({
+            name: 'WorkSessionsTable',
+            ref: 'A4',
+            headerRow: true,
+            totalsRow: rows.length > 0,
+            style: { theme: 'TableStyleMedium2', showRowStripes: true },
+            columns: [
+                { name: 'Date', totalsRowLabel: rows.length ? 'TOTAL' : undefined },
+                { name: 'Project' },
+                { name: 'Start Time' },
+                { name: 'End Time' },
+                { name: 'Duration' },
+                { name: 'Hours', totalsRowFunction: rows.length ? 'sum' : undefined }
+            ],
+            rows
+        });
+
+        sheet.columns = [
+            { width: 14 }, { width: 28 }, { width: 14 },
+            { width: 14 }, { width: 16 }, { width: 12 }
         ];
+        sheet.getColumn(6).numFmt = '0.00';
+        this.finishSheet(sheet, 6, rows.length + 5);
+    }
+
+    private addDailySummarySheet(workbook: ExcelJS.Workbook, logs: WorkLog[]): void {
+        const grouped = new Map<string, { date: string; project: string; sessions: number; durationMs: number }>();
+        for (const log of logs) {
+            const date = this.normalizedDate(log.date);
+            const project = log.project || 'unknown-project';
+            const key = `${date}\u0000${project}`;
+            const current = grouped.get(key) || { date, project, sessions: 0, durationMs: 0 };
+            current.sessions += 1;
+            current.durationMs += this.durationMs(log);
+            grouped.set(key, current);
+        }
+        const rows = Array.from(grouped.values())
+            .sort((a, b) => `${a.date}${a.project}`.localeCompare(`${b.date}${b.project}`))
+            .map(item => [item.date, item.project, item.sessions, this.formatter.formatDuration(item.durationMs), item.durationMs / 3_600_000]);
+
+        const sheet = workbook.addWorksheet('Daily Summary', {
+            views: [{ state: 'frozen', ySplit: 4 }],
+            properties: { tabColor: { argb: 'FF10B981' } },
+            pageSetup: { orientation: 'landscape', fitToPage: true, fitToWidth: 1 }
+        });
+        this.addSheetHeading(sheet, 'Daily Summary', 'Daily totals grouped by project');
+        sheet.addTable({
+            name: 'DailySummaryTable', ref: 'A4', headerRow: true, totalsRow: rows.length > 0,
+            style: { theme: 'TableStyleMedium4', showRowStripes: true },
+            columns: [
+                { name: 'Date', totalsRowLabel: rows.length ? 'TOTAL' : undefined },
+                { name: 'Project' },
+                { name: 'Sessions', totalsRowFunction: rows.length ? 'sum' : undefined },
+                { name: 'Total Time' },
+                { name: 'Hours', totalsRowFunction: rows.length ? 'sum' : undefined }
+            ],
+            rows
+        });
+        sheet.columns = [{ width: 14 }, { width: 30 }, { width: 12 }, { width: 16 }, { width: 12 }];
+        sheet.getColumn(5).numFmt = '0.00';
+        this.addHoursConditionalFormatting(sheet, `E5:E${Math.max(5, rows.length + 4)}`);
+        this.finishSheet(sheet, 5, rows.length + 5);
+    }
+
+    private addProjectSummarySheet(workbook: ExcelJS.Workbook, logs: WorkLog[]): void {
+        const grouped = new Map<string, { sessions: number; durationMs: number; lastActivity: string }>();
+        for (const log of logs) {
+            const project = log.project || 'unknown-project';
+            const date = this.normalizedDate(log.date);
+            const current = grouped.get(project) || { sessions: 0, durationMs: 0, lastActivity: date };
+            current.sessions += 1;
+            current.durationMs += this.durationMs(log);
+            if (date > current.lastActivity) {
+                current.lastActivity = date;
+            }
+            grouped.set(project, current);
+        }
+        const rows = Array.from(grouped.entries())
+            .sort((a, b) => b[1].durationMs - a[1].durationMs)
+            .map(([project, item]) => [project, item.sessions, this.formatter.formatDuration(item.durationMs), item.durationMs / 3_600_000, item.lastActivity]);
+
+        const sheet = workbook.addWorksheet('Project Summary', {
+            views: [{ state: 'frozen', ySplit: 4 }],
+            properties: { tabColor: { argb: 'FFF59E0B' } },
+            pageSetup: { orientation: 'landscape', fitToPage: true, fitToWidth: 1 }
+        });
+        this.addSheetHeading(sheet, 'Project Summary', 'Lifetime totals and latest activity');
+        sheet.addTable({
+            name: 'ProjectSummaryTable', ref: 'A4', headerRow: true, totalsRow: rows.length > 0,
+            style: { theme: 'TableStyleMedium9', showRowStripes: true },
+            columns: [
+                { name: 'Project', totalsRowLabel: rows.length ? 'TOTAL' : undefined },
+                { name: 'Sessions', totalsRowFunction: rows.length ? 'sum' : undefined },
+                { name: 'Total Time' },
+                { name: 'Hours', totalsRowFunction: rows.length ? 'sum' : undefined },
+                { name: 'Last Activity' }
+            ],
+            rows
+        });
+        sheet.columns = [{ width: 32 }, { width: 12 }, { width: 16 }, { width: 12 }, { width: 16 }];
+        sheet.getColumn(4).numFmt = '0.00';
+        this.addHoursConditionalFormatting(sheet, `D5:D${Math.max(5, rows.length + 4)}`);
+        this.finishSheet(sheet, 5, rows.length + 5);
+    }
+
+    private addSheetHeading(sheet: ExcelJS.Worksheet, title: string, subtitle: string): void {
+        sheet.mergeCells('A1:F1');
+        sheet.getCell('A1').value = title;
+        sheet.getCell('A1').font = { name: 'Aptos Display', size: 20, bold: true, color: { argb: 'FFFFFFFF' } };
+        sheet.getCell('A1').fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF172554' } };
+        sheet.getCell('A1').alignment = { vertical: 'middle', horizontal: 'left' };
+        sheet.getRow(1).height = 34;
+        sheet.mergeCells('A2:F2');
+        sheet.getCell('A2').value = `${subtitle} • Updated ${new Date().toLocaleString()}`;
+        sheet.getCell('A2').font = { italic: true, color: { argb: 'FF475569' } };
+        sheet.getRow(2).height = 22;
+    }
+
+    private addHoursConditionalFormatting(sheet: ExcelJS.Worksheet, ref: string): void {
+        sheet.addConditionalFormatting({
+            ref,
+            rules: [{
+                type: 'colorScale',
+                priority: 1,
+                cfvo: [{ type: 'min' }, { type: 'percentile', value: 50 }, { type: 'max' }],
+                color: [{ argb: 'FFFEE2E2' }, { argb: 'FFFEF3C7' }, { argb: 'FFDCFCE7' }]
+            }]
+        });
+    }
+
+    private finishSheet(sheet: ExcelJS.Worksheet, columnCount: number, rowCount: number): void {
+        sheet.autoFilter = { from: { row: 4, column: 1 }, to: { row: Math.max(4, rowCount), column: columnCount } };
+        sheet.headerFooter.oddFooter = 'Shirazen Time Tracker • Page &P of &N';
+        sheet.eachRow((row, rowNumber) => {
+            if (rowNumber >= 5) {
+                row.height = 21;
+                row.alignment = { vertical: 'middle' };
+            }
+        });
     }
 }
 
-// Timer Manager (Singleton)
-class TimerManager {
-    private static instance: TimerManager;
-    private timerDisplay: vscode.StatusBarItem;
-    private pauseResumeButton: vscode.StatusBarItem;
-    private startButton: vscode.StatusBarItem;
-    private stopButton: vscode.StatusBarItem;
-    private startTime: number;
+class TimerManager implements vscode.Disposable {
+    private readonly timerDisplay: vscode.StatusBarItem;
+    private readonly pauseResumeButton: vscode.StatusBarItem;
+    private readonly startButton: vscode.StatusBarItem;
+    private readonly saveButton: vscode.StatusBarItem;
+    private readonly formatter = new TimeFormatter();
     private intervalId?: NodeJS.Timeout;
-    private timeFormatter: ITimeFormatter;
-    private isPaused: boolean = false;
-    private pauseStartTime: number = 0;
-    private totalPausedTime: number = 0;
-    private isRunning: boolean = false;
+    private state: TimerState;
 
-    private constructor(timeFormatter: ITimeFormatter) {
-        this.timeFormatter = timeFormatter;
-        this.startTime = Date.now();
-        
-        // Create timer display (rightmost)
+    constructor(private readonly context: vscode.ExtensionContext) {
+        this.state = context.globalState.get<TimerState>(TIMER_STATE_KEY) || this.emptyState();
         this.timerDisplay = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 104);
-        this.timerDisplay.tooltip = 'Current work duration';
-        
-        // Create start button
         this.startButton = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 103);
-        this.startButton.text = `$(play-circle) Start`;
-        this.startButton.command = 'shirazen.startTimer';
-        this.startButton.tooltip = 'Start new timer';
-        
-        // Create stop/save button
-        this.stopButton = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 102);
-        this.stopButton.text = `$(debug-stop) Save`;
-        this.stopButton.command = 'shirazen.saveAndResetTimer';
-        this.stopButton.tooltip = 'Save and reset timer';
-        
-        // Create pause/resume button
+        this.saveButton = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 102);
         this.pauseResumeButton = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 101);
-        this.pauseResumeButton.command = 'shirazen.pauseResumeTimer';
-        this.pauseResumeButton.tooltip = 'Pause/Resume timer';
 
+        this.timerDisplay.tooltip = 'Current tracked work time';
+        this.startButton.text = '$(play-circle) Start';
+        this.startButton.command = 'shirazen.startTimer';
+        this.saveButton.text = '$(save) Save';
+        this.saveButton.command = 'shirazen.saveAndResetTimer';
+        this.pauseResumeButton.command = 'shirazen.pauseResumeTimer';
+        this.refreshInterval();
         this.updateUI();
     }
 
-    public static getInstance(timeFormatter: ITimeFormatter): TimerManager {
-        if (!TimerManager.instance) {
-            TimerManager.instance = new TimerManager(timeFormatter);
-        }
-        return TimerManager.instance;
+    public isRunning(): boolean {
+        return this.state.isRunning;
     }
 
-    private getProjectName(): string {
-        const workspaceFolders = vscode.workspace.workspaceFolders;
-        return workspaceFolders && workspaceFolders.length > 0
-            ? workspaceFolders[0].name
-            : 'unknown-project';
+    public startNewTimer(): void {
+        this.state = { isRunning: true, isPaused: false, startTime: Date.now(), pauseStartTime: 0, totalPausedTime: 0 };
+        void this.persist();
+        this.refreshInterval();
+        this.updateUI();
+    }
+
+    public togglePause(): void {
+        if (!this.state.isRunning) {
+            return;
+        }
+        if (this.state.isPaused) {
+            this.state.totalPausedTime += Date.now() - this.state.pauseStartTime;
+            this.state.pauseStartTime = 0;
+            this.state.isPaused = false;
+        } else {
+            this.state.pauseStartTime = Date.now();
+            this.state.isPaused = true;
+        }
+        void this.persist();
+        this.updateUI();
+    }
+
+    public stop(): void {
+        this.state = this.emptyState();
+        void this.persist();
+        this.refreshInterval();
+        this.updateUI();
+    }
+
+    public reset(): void {
+        this.startNewTimer();
+    }
+
+    public currentSession(): WorkLog | undefined {
+        if (!this.state.isRunning) {
+            return undefined;
+        }
+        const endDate = new Date();
+        const elapsed = this.elapsedTime();
+        return {
+            date: formatLocalDate(endDate),
+            duration: this.formatter.formatDuration(elapsed),
+            startTime: formatLocalTime(new Date(this.state.startTime)),
+            endTime: formatLocalTime(endDate),
+            project: this.projectName(),
+            totalDurationMs: elapsed
+        };
+    }
+
+    public elapsedTime(): number {
+        if (!this.state.isRunning) {
+            return 0;
+        }
+        const referenceTime = this.state.isPaused ? this.state.pauseStartTime : Date.now();
+        return Math.max(0, referenceTime - this.state.startTime - this.state.totalPausedTime);
+    }
+
+    private projectName(): string {
+        const configured = vscode.workspace.getConfiguration('shirazenTimeTracker').get<string>('defaultProject', '').trim();
+        if (configured) {
+            return configured;
+        }
+        return vscode.workspace.workspaceFolders?.[0]?.name || 'unknown-project';
     }
 
     private updateUI(): void {
-        const projectName = this.getProjectName();
-        const elapsedTime = this.getElapsedTime();
-        
-        // Update timer display
-        this.timerDisplay.text = `$(clock) ${this.timeFormatter.formatDuration(elapsedTime)} (${projectName})`;
+        const project = this.projectName();
+        this.timerDisplay.text = `$(clock) ${this.formatter.formatDuration(this.elapsedTime())} (${project})`;
         this.timerDisplay.show();
-
-        // Update buttons visibility and state
-        if (this.isRunning) {
+        if (this.state.isRunning) {
             this.startButton.hide();
-            this.stopButton.show();
+            this.saveButton.show();
             this.pauseResumeButton.show();
-            
-            if (this.isPaused) {
-                this.pauseResumeButton.text = `$(debug-continue) Resume`;
-                this.pauseResumeButton.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
-            } else {
-                this.pauseResumeButton.text = `$(debug-pause) Pause`;
-                this.pauseResumeButton.backgroundColor = undefined;
-            }
+            this.pauseResumeButton.text = this.state.isPaused ? '$(debug-continue) Resume' : '$(debug-pause) Pause';
+            this.pauseResumeButton.backgroundColor = this.state.isPaused
+                ? new vscode.ThemeColor('statusBarItem.warningBackground')
+                : undefined;
         } else {
             this.startButton.show();
-            this.stopButton.hide();
+            this.saveButton.hide();
             this.pauseResumeButton.hide();
         }
     }
 
-    public startNewTimer(): void {
-        this.startTime = Date.now();
-        this.isPaused = false;
-        this.pauseStartTime = 0;
-        this.totalPausedTime = 0;
-        this.isRunning = true;
-        this.startTimer();
-        this.updateUI();
-        vscode.window.showInformationMessage('Timer started');
-    }
-
-    public stopTimer(): void {
+    private refreshInterval(): void {
         if (this.intervalId) {
             clearInterval(this.intervalId);
             this.intervalId = undefined;
         }
-        this.isRunning = false;
-        this.isPaused = false;
-        this.updateUI();
-    }
-
-    private startTimer(): void {
-        if (this.intervalId) {
-            clearInterval(this.intervalId);
+        if (this.state.isRunning && !this.state.isPaused) {
+            this.intervalId = setInterval(() => this.updateUI(), 1_000);
         }
-        this.updateUI();
-        this.intervalId = setInterval(() => this.updateUI(), 1000);
     }
 
-    public togglePause(): void {
-        if (!this.isRunning) return;
-
-        if (this.isPaused) {
-            // Resume
-            this.totalPausedTime += (Date.now() - this.pauseStartTime);
-            this.isPaused = false;
-            vscode.window.showInformationMessage('Timer resumed');
-        } else {
-            // Pause
-            this.pauseStartTime = Date.now();
-            this.isPaused = true;
-            vscode.window.showInformationMessage('Timer paused');
-        }
-        this.updateUI();
+    private async persist(): Promise<void> {
+        await this.context.globalState.update(TIMER_STATE_KEY, this.state);
     }
 
-    public getCurrentSession(): IWorkLog {
-        const endTime = new Date();
-        const startDate = new Date(this.startTime);
-        const elapsedTime = this.getElapsedTime();
-        
-        return {
-            date: endTime.toLocaleDateString(),
-            duration: this.timeFormatter.formatDuration(elapsedTime),
-            startTime: startDate.toLocaleTimeString(),
-            endTime: endTime.toLocaleTimeString(),
-            project: this.getProjectName(),
-            totalDurationMs: elapsedTime
-        };
-    }
-
-    public getElapsedTime(): number {
-        const now = Date.now();
-        let elapsedTime = now - this.startTime - this.totalPausedTime;
-        
-        if (this.isPaused) {
-            elapsedTime -= (now - this.pauseStartTime);
-        }
-        
-        return elapsedTime;
+    private emptyState(): TimerState {
+        return { isRunning: false, isPaused: false, startTime: 0, pauseStartTime: 0, totalPausedTime: 0 };
     }
 
     public dispose(): void {
@@ -459,112 +416,136 @@ class TimerManager {
         }
         this.timerDisplay.dispose();
         this.startButton.dispose();
-        this.stopButton.dispose();
+        this.saveButton.dispose();
         this.pauseResumeButton.dispose();
     }
 }
 
-// Extension Controller
-export class ExtensionController {
-    private timerManager: TimerManager;
-    private jsonStorage: IStorageStrategy;
-    private excelStorage: IStorageStrategy;
-    private context: vscode.ExtensionContext;
+class ExtensionController implements vscode.Disposable {
+    private readonly timer: TimerManager;
+    private readonly logs: WorkLogRepository;
+    private readonly formatter = new TimeFormatter();
 
-    constructor(context: vscode.ExtensionContext) {
-        const timeFormatter = new TimeFormatter();
-        this.context = context;
-        this.timerManager = TimerManager.getInstance(timeFormatter);
-        
-        const storageDirectory = context.globalStoragePath;
-        if (!fs.existsSync(storageDirectory)) {
-            fs.mkdirSync(storageDirectory, { recursive: true });
-        }
-
-        const workLogsFile = path.join(storageDirectory, 'work-logs.json');
-        const excelFile = path.join(storageDirectory, `${this.getProjectName()}.xlsx`);
-
-        this.jsonStorage = new JsonStorageStrategy(workLogsFile);
-        this.excelStorage = new ExcelStorageStrategy(excelFile, timeFormatter);
-
+    constructor(private readonly context: vscode.ExtensionContext) {
+        this.timer = new TimerManager(context);
+        this.logs = new WorkLogRepository(context.globalStorageUri.fsPath);
         this.registerCommands();
-    }
-
-    private getProjectName(): string {
-        const workspaceFolders = vscode.workspace.workspaceFolders;
-        return workspaceFolders && workspaceFolders.length > 0
-            ? workspaceFolders[0].name
-            : 'unknown-project';
+        context.subscriptions.push(this.timer);
     }
 
     private registerCommands(): void {
         this.context.subscriptions.push(
             vscode.commands.registerCommand('shirazen.startTimer', () => this.startTimer()),
-            vscode.commands.registerCommand('shirazen.saveAndResetTimer', () => this.saveAndResetTimer()),
-            vscode.commands.registerCommand('shirazen.pauseResumeTimer', () => this.pauseResumeTimer()),
+            vscode.commands.registerCommand('shirazen.saveAndResetTimer', () => this.saveAndReset()),
+            vscode.commands.registerCommand('shirazen.pauseResumeTimer', () => this.pauseResume()),
+            vscode.commands.registerCommand('shirazen.stopTimer', () => this.stopTimer()),
+            vscode.commands.registerCommand('shirazen.resetTimer', () => this.resetTimer()),
+            vscode.commands.registerCommand('shirazen.showTodaySummary', () => this.showTodaySummary()),
             vscode.commands.registerCommand('shirazen.openFolder', () => this.openFolder())
         );
     }
 
     private startTimer(): void {
-        this.timerManager.startNewTimer();
+        if (this.timer.isRunning()) {
+            void vscode.window.showWarningMessage('A timer is already running.');
+            return;
+        }
+        this.timer.startNewTimer();
+        void vscode.window.showInformationMessage('Shirazen timer started.');
     }
 
-    private async saveAndResetTimer(): Promise<void> {
+    private async saveAndReset(): Promise<void> {
+        const session = this.timer.currentSession();
+        if (!session) {
+            await vscode.window.showWarningMessage('Start the timer before saving a session.');
+            return;
+        }
+        if (session.totalDurationMs < 1_000) {
+            await vscode.window.showWarningMessage('The current session is too short to save.');
+            return;
+        }
         try {
-            const workLog = this.timerManager.getCurrentSession();
-            
-            this.jsonStorage.save(workLog);
-            this.excelStorage.save(workLog);
-
-            vscode.window.showInformationMessage(
-                `Work time saved for project ${workLog.project}: ${workLog.duration}`
-            );
-
-            // Open the folder after saving
-            vscode.env.openExternal(vscode.Uri.file(this.context.globalStoragePath));
-
-            // Start a new timer session instead of stopping
-            this.timerManager.startNewTimer();
+            await this.logs.save(session);
+            this.timer.startNewTimer();
+            await vscode.window.showInformationMessage(`Saved ${session.duration} for ${session.project}.`);
         } catch (error) {
-            vscode.window.showErrorMessage('Error saving work time');
-            console.error('Error:', error);
+            console.error('Unable to save work session:', error);
+            await vscode.window.showErrorMessage('Could not save the work session. Your timer is still running.');
         }
     }
 
-    private async pauseResumeTimer(): Promise<void> {
-        this.timerManager.togglePause();
+    private pauseResume(): void {
+        if (!this.timer.isRunning()) {
+            void vscode.window.showWarningMessage('Start the timer first.');
+            return;
+        }
+        this.timer.togglePause();
     }
 
-    private openFolder(): void {
-        vscode.env.openExternal(vscode.Uri.file(this.context.globalStoragePath));
+    private async stopTimer(): Promise<void> {
+        if (!this.timer.isRunning()) {
+            await vscode.window.showWarningMessage('No timer is running.');
+            return;
+        }
+        const choice = await vscode.window.showQuickPick(
+            ['Save and stop', 'Discard and stop', 'Cancel'],
+            { placeHolder: 'What should happen to the current session?' }
+        );
+        if (!choice || choice === 'Cancel') {
+            return;
+        }
+        if (choice === 'Save and stop') {
+            const session = this.timer.currentSession();
+            if (session && session.totalDurationMs >= 1_000) {
+                try {
+                    await this.logs.save(session);
+                } catch (error) {
+                    console.error('Unable to save work session:', error);
+                    await vscode.window.showErrorMessage('Could not save the session. The timer was not stopped.');
+                    return;
+                }
+            }
+        }
+        this.timer.stop();
+        await vscode.window.showInformationMessage('Shirazen timer stopped.');
+    }
+
+    private async resetTimer(): Promise<void> {
+        if (!this.timer.isRunning()) {
+            await vscode.window.showWarningMessage('No timer is running.');
+            return;
+        }
+        const choice = await vscode.window.showWarningMessage(
+            'Reset the current timer without saving it?',
+            { modal: true },
+            'Reset'
+        );
+        if (choice === 'Reset') {
+            this.timer.reset();
+        }
+    }
+
+    private async showTodaySummary(): Promise<void> {
+        const summary = this.logs.getTodaySummary();
+        await vscode.window.showInformationMessage(
+            `Today: ${summary.sessions} session${summary.sessions === 1 ? '' : 's'} • ${this.formatter.formatDuration(summary.durationMs)}`
+        );
+    }
+
+    private async openFolder(): Promise<void> {
+        await vscode.commands.executeCommand('revealFileInOS', this.context.globalStorageUri);
     }
 
     public dispose(): void {
-        // Save work time before disposing
-        if (this.timerManager) {
-            this.saveAndResetTimer().then(() => {
-                this.timerManager.dispose();
-            });
-        }
+        // Timer state is already persisted. Deactivation must never create a work log.
     }
 }
 
-// Extension Entry Points
 export function activate(context: vscode.ExtensionContext): void {
     const controller = new ExtensionController(context);
-    context.subscriptions.push({ dispose: () => controller.dispose() });
-
-    // Register window state change handler for auto-save
-    context.subscriptions.push(
-        vscode.window.onDidChangeWindowState(e => {
-            if (!e.focused) {
-                controller.dispose();
-            }
-        })
-    );
+    context.subscriptions.push(controller);
 }
 
 export function deactivate(): void {
-    // Cleanup is handled by the ExtensionController's dispose method
-} 
+    // Resources are disposed through context.subscriptions.
+}
