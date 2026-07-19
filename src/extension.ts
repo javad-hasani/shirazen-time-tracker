@@ -54,6 +54,10 @@ class WorkLogRepository {
         await this.writeProfessionalWorkbook(logs);
     }
 
+    public getExcelFileUri(): vscode.Uri {
+        return vscode.Uri.file(this.excelFile);
+    }
+
     public getTodaySummary(): { sessions: number; durationMs: number } {
         const today = formatLocalDate(new Date());
         const logs = this.getLogs().filter(log => this.normalizedDate(log.date) === today);
@@ -467,10 +471,33 @@ class ExtensionController implements vscode.Disposable {
         try {
             await this.logs.save(session);
             this.timer.startNewTimer();
-            await vscode.window.showInformationMessage(`Saved ${session.duration} for ${session.project}.`);
+            await this.showSavedReport(session);
         } catch (error) {
             console.error('Unable to save work session:', error);
             await vscode.window.showErrorMessage('Could not save the work session. Your timer is still running.');
+        }
+    }
+
+    private async showSavedReport(session: WorkLog): Promise<void> {
+        const excelFile = this.logs.getExcelFileUri();
+        const action = await vscode.window.showInformationMessage(
+            `Saved ${session.duration} for ${session.project}. Excel report: ${excelFile.fsPath}`,
+            'Open Excel',
+            'Show in Folder'
+        );
+
+        if (action === 'Open Excel') {
+            const opened = await vscode.env.openExternal(excelFile);
+            if (!opened) {
+                await vscode.window.showWarningMessage(
+                    `Could not open the Excel report automatically. File: ${excelFile.fsPath}`
+                );
+            }
+            return;
+        }
+
+        if (action === 'Show in Folder') {
+            await vscode.commands.executeCommand('revealFileInOS', excelFile);
         }
     }
 
